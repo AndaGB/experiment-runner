@@ -13,7 +13,10 @@ from ConfigValidator.Config.RunnerConfig import RunnerConfig
 from ProgressManager.Output.OutputProcedure import OutputProcedure as output
 from EventManager.EventSubscriptionController import EventSubscriptionController
 from ConfigValidator.CustomErrors.ProgressErrors import AllRunsCompletedOnRestartError
-from ProgressManager.Validation.EnergyValidator import EnergyValidator
+from ProgressManager.Validation.AnomaliesChecker import (
+    ResultsValidator,
+    AnomalyReport
+)
 from pathlib import Path
 
 
@@ -35,6 +38,7 @@ class ExperimentController:
     def __init__(self, config: RunnerConfig, metadata: Metadata):
         self.config = config
         self.metadata = metadata
+        self.validation_results: dict[str, AnomalyReport] = {}
 
         self.csv_data_manager = CSVOutputManager(self.config.experiment_path)
         self.json_data_manager = JSONOutputManager(self.config.experiment_path)
@@ -150,7 +154,24 @@ class ExperimentController:
             )
             perform_run.start()
             perform_run.join()
+            
+            # -- Checks for anomalies in the run raw result
+            run_id = current_run["__run_id"]
+            treatment_levels = {
+                k: v
+                for k, v in current_run.items()
+                if not k.startswith("__")
+            }
 
+            run_dir = self.config.experiment_path / run_id
+            run_report = ResultsValidator.validate_output_log(
+                run_dir,
+                run_id,
+                treatment_levels,
+            )
+            if run_report.has_anomalies():
+                self.validation_results[run_id] = run_report
+            
             time_btwn_runs = self.config.time_between_runs_in_ms
             if time_btwn_runs > 0:
                 output.console_log_bold(f"Run fully ended, waiting for: {time_btwn_runs}ms == {time_btwn_runs / 1000}s")
@@ -165,13 +186,13 @@ class ExperimentController:
         output.console_log_WARNING("Calling after_experiment config hook")
         EventSubscriptionController.raise_event(RunnerEvents.AFTER_EXPERIMENT)
 
-        # -- Energy validation
-        if self.config.energy_validation_columns:
-            updated_run_table = self.csv_data_manager.read_run_table()
-            energy_report = EnergyValidator.validate_run_table(updated_run_table, self.config.energy_validation_columns)
-            
-            if energy_report.has_anomalies():
-                log_file_path = (self.config.experiment_path / self.config.energy_validation_log_file)
+       # -- Anomalies Report creation
+        combined_report = AnomalyReport()
 
-                output.console_log_WARNING(f"Energy anomalies detected. Report saved to {log_file_path}")
-                EnergyValidator.save_report_to_file(energy_report, self.config.energy_validation_columns, log_file_path)
+        for report in self.validation_results.values():
+            combined_report.anomalies.extend(report.anomalies)
+
+        if combined_report.has_anomalies():
+            log_file_path = (self.config.experiment_path / self.config.energy_validation_log_file)
+            output.console_log_WARNING(f"Anomalies detected. Report saved to {log_file_path}")
+            ResultsValidator.save_report_to_file(combined_report, log_file_path)
